@@ -1,0 +1,161 @@
+name: Track All Repository Clones
+
+on:
+  schedule:
+    - cron: '33 3 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/track-clones.yml'
+      - 'README.md'
+
+jobs:
+  track-clones:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # REQUIRED to allow git push
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize tracking system
+        run: |
+          mkdir -p analytics
+          CURRENT_TIMESTAMP=$(TZ='Etc/GMT+3' date '+%Y-%m-%d %H:%M:%S GMT-3')
+          
+          if [ ! -f analytics/tracking-started.txt ]; then
+            echo "First run detected - initializing tracking system"
+            echo "$CURRENT_TIMESTAMP" > analytics/tracking-started.txt
+            echo "Tracking started: $CURRENT_TIMESTAMP"
+            echo "---"
+          else
+            TRACKING_STARTED=$(cat analytics/tracking-started.txt)
+            echo "Tracking system started on: $TRACKING_STARTED"
+            echo "Current run: $CURRENT_TIMESTAMP"
+            echo "---"
+          fi
+
+      - name: Extract repositories from README
+        run: |
+          # Clean extraction of owner/repo
+          grep -oP 'https://github\.com/\K[\w-]+/[\w.-]+' README.md | sort -u > extracted_repos.txt
+          echo "Extracted repositories:"
+          cat extracted_repos.txt
+          echo "---"
+
+      - name: Fetch and record clone data
+        env:
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: |
+          TIMESTAMP=$(TZ='Etc/GMT+3' date +%Y-%m-%d_%H-%M-%S)
+          READABLE_TIMESTAMP=$(TZ='Etc/GMT+3' date '+%Y-%m-%d %H:%M:%S GMT-3')
+          
+          echo "Processing repositories..."
+          echo ""
+          
+          AGGREGATE_TOTAL=0
+          AGGREGATE_UNIQUE=0
+          
+          while IFS= read -r REPO_FULL_NAME || [ -n "$REPO_FULL_NAME" ]; do
+            [[ -z "$REPO_FULL_NAME" ]] && continue
+            
+            # Clean potential trailing dots or slashes from regex capture
+            REPO_FULL_NAME=$(echo "$REPO_FULL_NAME" | sed 's/[./]*$//')
+            
+            REPO_OWNER="${REPO_FULL_NAME%/*}"
+            REPO_NAME="${REPO_FULL_NAME#*/}"
+            
+            echo "Fetching data for: $REPO_FULL_NAME"
+            
+            mkdir -p "analytics/$REPO_NAME"
+            
+            # API Call with HTTP Code capture
+            HTTP_RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: token $TRAFFIC_TOKEN" "https://api.github.com/repos/$REPO_FULL_NAME/traffic/clones")
+            
+            # Separate body from status code (last 3 chars are status code)
+            HTTP_BODY=${HTTP_RESPONSE:0:${#HTTP_RESPONSE}-3}
+            HTTP_STATUS=${HTTP_RESPONSE:${#HTTP_RESPONSE}-3}
+            
+            if [ "$HTTP_STATUS" != "200" ]; then
+                echo "::error::Failed to fetch data for $REPO_FULL_NAME. Status: $HTTP_STATUS"
+                echo "API Response: $HTTP_BODY"
+                continue
+            fi
+
+            # Parse using jq (More robust than grep)
+            CURRENT_TOTAL=$(echo "$HTTP_BODY" | jq '.count // 0')
+            CURRENT_UNIQUE=$(echo "$HTTP_BODY" | jq '.uniques // 0')
+            
+            echo "  > API returned: $CURRENT_TOTAL total, $CURRENT_UNIQUE unique"
+            
+            BASELINE_FILE="analytics/$REPO_NAME/baseline.json"
+            
+            # Initialize or Read Baseline
+            if [ -f "$BASELINE_FILE" ]; then
+              BASELINE_TOTAL=$(jq '.initial_total_clones // 0' "$BASELINE_FILE")
+              BASELINE_UNIQUE=$(jq '.initial_unique_clones // 0' "$BASELINE_FILE")
+              TRACKING_STARTED=$(jq -r '.tracking_started' "$BASELINE_FILE")
+            else
+              BASELINE_TOTAL=$CURRENT_TOTAL
+              BASELINE_UNIQUE=$CURRENT_UNIQUE
+              TRACKING_STARTED=$(cat analytics/tracking-started.txt)
+              
+              # Create baseline using jq to ensure valid JSON
+              jq -n \
+                --arg start "$TRACKING_STARTED" \
+                --argjson total "$BASELINE_TOTAL" \
+                --argjson unique "$BASELINE_UNIQUE" \
+                '{tracking_started: $start, initial_total_clones: $total, initial_unique_clones: $unique}' > "$BASELINE_FILE"
+            fi
+            
+            # Math
+            TOTAL_WITH_BASELINE=$((CURRENT_TOTAL + BASELINE_TOTAL))
+            UNIQUE_WITH_BASELINE=$((CURRENT_UNIQUE + BASELINE_UNIQUE))
+            
+            AGGREGATE_TOTAL=$((AGGREGATE_TOTAL + TOTAL_WITH_BASELINE))
+            AGGREGATE_UNIQUE=$((AGGREGATE_UNIQUE + UNIQUE_WITH_BASELINE))
+            
+            # Save Record
+            jq -n \
+              --arg repo "$REPO_FULL_NAME" \
+              --arg ts "$READABLE_TIMESTAMP" \
+              --arg start "$TRACKING_STARTED" \
+              --argjson c_total "$CURRENT_TOTAL" \
+              --argjson c_unique "$CURRENT_UNIQUE" \
+              --argjson b_total "$BASELINE_TOTAL" \
+              --argjson b_unique "$BASELINE_UNIQUE" \
+              --argjson cum_total "$TOTAL_WITH_BASELINE" \
+              --argjson cum_unique "$UNIQUE_WITH_BASELINE" \
+              '{repository: $repo, timestamp: $ts, tracking_started: $start, current_period: {total_clones: $c_total, unique_clones: $c_unique}, baseline: {total_clones: $b_total, unique_clones: $b_unique}, cumulative: {total_clones: $cum_total, unique_clones: $cum_unique}}' > "analytics/$REPO_NAME/clones_$TIMESTAMP.json"
+            
+            echo "  > Saved record."
+            echo ""
+            
+          done < extracted_repos.txt
+          
+          # Save Ecosystem Totals
+          jq -n \
+            --arg ts "$READABLE_TIMESTAMP" \
+            --argjson total "$AGGREGATE_TOTAL" \
+            --argjson unique "$AGGREGATE_UNIQUE" \
+            '{timestamp: $ts, ecosystem_totals: {total_clones: $total, unique_clones: $unique}}' > "analytics/aggregate_$TIMESTAMP.json"
+          
+          echo "====================================="
+          echo "Ecosystem-wide Statistics"
+          echo "Recorded at: $READABLE_TIMESTAMP"
+          echo "Total clones: $AGGREGATE_TOTAL"
+          echo "Total unique: $AGGREGATE_UNIQUE"
+
+      - name: Commit and push data
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add analytics/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            COMMIT_TIME=$(TZ='Etc/GMT+3' date '+%Y-%m-%d %H:%M:%S GMT-3')
+            git commit -m "Update clone statistics - $COMMIT_TIME"
+            git push
+          fi
